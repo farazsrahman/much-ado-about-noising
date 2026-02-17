@@ -426,12 +426,13 @@ class TrainingAgent:
 
         torch.save(checkpoint, path)
 
-    def load(self, path: str, load_optimizer: bool = False):
+    def load(self, path: str, load_optimizer: bool = False, strict: bool = True):
         """Load agent models from path.
 
         Args:
             path: Path to load checkpoint from
             load_optimizer: Whether to load optimizer state
+            strict: forwarded to .load_state_dict(...) calls
 
         Returns:
             training_state dict if available, None otherwise
@@ -440,10 +441,10 @@ class TrainingAgent:
         state_dict = torch.load(
             path, map_location=self.config.optimization.device, weights_only=False
         )
-        self.flow_map.load_state_dict(state_dict["flow_map"])
-        self.encoder.load_state_dict(state_dict["encoder"])
-        self.encoder_ema.load_state_dict(state_dict["encoder_ema"])
-        self.flow_map_ema.load_state_dict(state_dict["flow_map_ema"])
+        self.flow_map.load_state_dict(state_dict["flow_map"], strict=strict)
+        self.encoder.load_state_dict(state_dict["encoder"], strict=strict)
+        self.encoder_ema.load_state_dict(state_dict["encoder_ema"], strict=strict)
+        self.flow_map_ema.load_state_dict(state_dict["flow_map_ema"], strict=strict)
 
         # Load optimizer state if requested and available
         if load_optimizer and "optimizer" in state_dict:

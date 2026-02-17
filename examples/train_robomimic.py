@@ -16,7 +16,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Set MuJoCo rendering backend before importing any robomimic/mujoco modules
 # Try OSMesa for headless rendering (software rendering, more compatible but slower)
-os.environ["MUJOCO_GL"] = "osmesa"  # noqa: E402
+# os.environ["MUJOCO_GL"] = "osmesa"  # noqa: E402
+os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 
 # Import mip modules after setting environment variables
 from mip.agent import TrainingAgent  # noqa: E402
