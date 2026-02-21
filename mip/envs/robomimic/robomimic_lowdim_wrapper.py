@@ -77,12 +77,17 @@ class RobomimicLowdimWrapper(gym.Env):
 
         # return obs and info (Gymnasium API requires both)
         obs = self.get_observation()
-        info = {}
+        # Get raw observation and state for info
+        raw_obs = self.env.get_observation()
+        state = self.env.get_state()["states"]
+        info = {"raw_obs": raw_obs, "states": state}
         return obs, info
 
     def step(self, action):
         raw_obs, reward, done, info = self.env.step(action)
         obs = np.concatenate([raw_obs[key] for key in self.obs_keys], axis=0)
+        info["raw_obs"] = raw_obs
+        info["states"] = self.env.get_state()["states"]
         return obs, reward, done, info
 
     def render(self, mode="rgb_array"):

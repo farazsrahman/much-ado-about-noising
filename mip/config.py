@@ -122,6 +122,9 @@ class TaskConfig:
     random_crop: bool = True
     use_group_norm: bool = True
     use_seq: bool = True
+    # Collection (e.g. collect_robomimic.py)
+    num_demos: int = 50
+    rejection_sample: bool = False  # If True, only keep successful episodes until num_demos reached
 
 
 @dataclass

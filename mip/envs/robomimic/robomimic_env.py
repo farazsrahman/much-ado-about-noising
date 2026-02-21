@@ -48,7 +48,7 @@ def make_vec_env(task_config: TaskConfig, seed=None):
         raise ValueError(f"Environment {task_config.env_name} not supported")
 
 
-def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
+def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None, init_state=None, video_path=None):
     from mip.envs.robomimic.robomimic_image_wrapper import (
         RobomimicImageWrapper,
     )
@@ -78,7 +78,7 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
                 env_meta=env_meta,
                 render=False,
                 render_offscreen=enable_render
-                if task_config.obs_type == "image"
+                if (task_config.obs_type == "image" or task_config.save_video)
                 else False,
                 use_image_obs=enable_render
                 if task_config.obs_type == "image"
@@ -109,15 +109,13 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
             # disable object state observation for image mode
             env_meta["env_kwargs"]["use_object_obs"] = False
         abs_action = task_config.abs_action
-        if abs_action:
-            env_meta["env_kwargs"]["controller_configs"]["control_delta"] = False
 
         if task_config.obs_type == "state":
             env = create_robomimic_env(env_meta=env_meta, obs_keys=task_config.obs_keys)
             env = RobomimicLowdimWrapper(
                 env=env,
                 obs_keys=task_config.obs_keys,
-                init_state=None,
+                init_state=init_state,
                 render_hw=(256, 256),
                 render_camera_name="agentview",
             )
@@ -131,7 +129,7 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
             env = RobomimicImageWrapper(
                 env=env,
                 shape_meta=task_config.shape_meta,
-                init_state=None,
+                init_state=init_state,
                 render_obs_key=task_config.render_obs_key,
             )
 
@@ -143,7 +141,11 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
             thread_type="FRAME",
             thread_count=1,
         )
-        file_path = None if not render else "results/video.mp4"
+        if video_path is not None:
+            file_path = video_path
+        else:
+            file_path = None if not render else "results/video.mp4"
+
         env = VideoRecordingWrapper(
             env, video_recoder, file_path=file_path, steps_per_render=2
         )
@@ -152,6 +154,7 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
             n_obs_steps=task_config.obs_steps,
             n_action_steps=task_config.act_steps,
             max_episode_steps=task_config.max_episode_steps,
+            terminate_on_success=True
         )
         if seed is not None:
             env.seed(seed + idx)

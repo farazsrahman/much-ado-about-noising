@@ -63,7 +63,10 @@ def repeated_space(space, n):
 def take_last_n(x, n):
     x = list(x)
     n = min(len(x), n)
-    return np.array(x[-n:])
+    res = x[-n:]
+    if len(res) > 0 and isinstance(res[0], (int, float, np.float32, np.float64, np.ndarray)):
+        return np.array(res)
+    return res
 
 
 def dict_take_last_n(x, n):
@@ -100,6 +103,40 @@ def stack_last_n_obs(all_obs, n_steps):
     return result
 
 
+def did_complete_task(env, done=None, terminated=None, info=None):
+    """Returns True if task is complete. Pass step return values when available."""
+
+    # NOTE (faraz): a little hacky but should get the job done of unwrapping the VideoRecordingWrapper
+    if type(env).__name__ == "VideoRecordingWrapper":
+        env = env.env
+
+    # Robomimic
+    if hasattr(env.env, 'is_success') and callable(env.env.is_success):
+        try:
+            # NOTE (faraz): sometimes the robomimic environment has `ignore_done=True` which means that
+            # done is not a good source of truth for whether the episode is actually finished or not.
+            is_success = env.env.is_success().get("task", np.False_)
+            return is_success
+        except (KeyError, TypeError):
+            return False
+
+    # TODO (faraz): Check this code more thoroughly before trusting it.
+    raise NotImplementedError("Task completion logic not tested for non-Robomimic environments.")
+
+    # PushT: success is in terminated
+    if terminated:
+        return True
+
+    # Kitchen: check info after step
+    if info is not None and "completed_tasks" in info:
+        completed = info["completed_tasks"]
+        # Handle batched/structured info
+        if isinstance(completed, (list, tuple)):
+            completed = completed[0] if completed else set()
+        return len(completed) >= 4
+
+    return False
+
 class MultiStepWrapper:
     """Multi-step wrapper that works with both old gym and new gymnasium."""
 
@@ -110,6 +147,7 @@ class MultiStepWrapper:
         n_action_steps,
         max_episode_steps=None,
         reward_agg_method="max",
+        terminate_on_success=False
     ):
         self.env = env
         self._action_space = repeated_space(env.action_space, n_action_steps)
@@ -119,10 +157,13 @@ class MultiStepWrapper:
         self.n_action_steps = n_action_steps
         self.reward_agg_method = reward_agg_method
 
-        self.obs = deque(maxlen=n_obs_steps + 1)
+        history_len = max(n_obs_steps, n_action_steps) + 1
+        self.obs = deque(maxlen=history_len)
         self.reward = []
         self.done = []
-        self.info = defaultdict(lambda: deque(maxlen=n_obs_steps + 1))
+        self.info = defaultdict(lambda: deque(maxlen=history_len))
+
+        self.terminate_on_success = terminate_on_success
 
     @property
     def observation_space(self):
@@ -177,16 +218,39 @@ class MultiStepWrapper:
             obs = result
             info = {}
 
-        self.obs = deque([obs], maxlen=self.n_obs_steps + 1)
+        history_len = max(self.n_obs_steps, self.n_action_steps) + 1
+        self.obs = deque([obs], maxlen=history_len)
         self.reward = []
         self.done = []
-        self.info = defaultdict(lambda: deque(maxlen=self.n_obs_steps + 1))
+        self.info = defaultdict(lambda: deque(maxlen=history_len))
+        self._add_info(info)
+        self.step_count = 0
 
         obs = self._get_obs(self.n_obs_steps)
+        # Repeat initial state history_len times to match step() return shape
+        info = {}
+        for key, value_deque in self.info.items():
+            if len(value_deque) > 0:
+                single_val = value_deque[-1]
+                if isinstance(single_val, np.ndarray):
+                    info[key] = np.repeat(
+                        np.expand_dims(single_val, axis=0), history_len, axis=0
+                    )
+                else:
+                    info[key] = [single_val] * history_len
+            else:
+                info[key] = []
+        # Initialize rewards and dones for consistency
+        info["rewards"] = []
+        info["dones"] = []
         return obs, info
 
     def step(self, action):
         """actions: (n_action_steps,) + action_shape."""
+        self.reward = []
+        self.done = []
+
+        completed_task = False
         for act in action:
             if len(self.done) > 0 and self.done[-1]:
                 # termination
@@ -199,23 +263,46 @@ class MultiStepWrapper:
                 done = terminated or truncated
             else:
                 observation, reward, done, info = result
+                terminated = None
 
             self.obs.append(observation)
             self.reward.append(reward)
+            self.step_count += 1
             if (self.max_episode_steps is not None) and (
-                len(self.reward) >= self.max_episode_steps
+                self.step_count >= self.max_episode_steps
             ):
                 # truncation
                 done = True
             self.done.append(done)
+
             self._add_info(info)
+
+            completed_task = completed_task or did_complete_task(self.env, done, terminated, info)
+
+        # if completed_task:
+        #     print("Completed Task")
+        #     print("Done:", done)
 
         observation = self._get_obs(self.n_obs_steps)
         reward = aggregate(self.reward, self.reward_agg_method)
         done = aggregate(self.done, "max")
-        info = dict_take_last_n(self.info, self.n_obs_steps)
+        # Return all available history in info
+        history_len = self.obs.maxlen
+        info = dict_take_last_n(self.info, history_len)
+        # Assert info length matches history_len (raw_obs, states, etc.)
+        for key in info:
+            if key in ("rewards", "dones"):
+                continue
+            val = info[key]
+            length = len(val) if isinstance(val, (list, np.ndarray)) else 1
+            assert length == history_len, (
+                f"info['{key}'] length {length} != history_len {history_len}"
+            )
+        # Add sub-step rewards and dones to info for easier extraction
+        info["rewards"] = self.reward.copy()
+        info["dones"] = self.done.copy()
         # Return in new Gymnasium 5-value format
-        terminated = done
+        terminated = done or (completed_task and self.terminate_on_success)
         truncated = False  # Truncation is already handled above
         return observation, reward, terminated, truncated, info
 
@@ -367,7 +454,10 @@ class VideoRecordingWrapper:
             if not self.video_recoder.is_ready():
                 self.video_recoder.start(self.file_path)
 
-            frame = self.env.render(**self.render_kwargs)
+            # NOTE (faraz): in the Push T environment .render requires a mode, but self.render_kwargs does not contain this
+            # I am not currently sure if this is also an issue for other environments, but I am adding self.mode to get this to work
+            # it should not break anything else.
+            frame = self.env.render(self.mode, **self.render_kwargs)
             assert frame.dtype == np.uint8
             self.video_recoder.write_frame(frame)
         return result
