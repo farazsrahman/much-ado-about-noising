@@ -31,8 +31,16 @@ register_codecs()
 
 
 def make_dataset(task_config, mode="train"):
+
+    if hasattr(task_config, "dataset_path") \
+        and task_config.dataset_path is not None \
+        and task_config.dataset_path != "default":
+        # NOTE (faraz): a manually provided path shuold override the hugging face one if provided.
+        # Use explicit path if provided
+        dataset_path = os.path.expanduser(task_config.dataset_path)
+
     # Check if we should download from HuggingFace
-    if hasattr(task_config, "dataset_repo") and hasattr(
+    elif hasattr(task_config, "dataset_repo") and hasattr(
         task_config, "dataset_filename"
     ):
         # Auto-download from HuggingFace
@@ -45,13 +53,14 @@ def make_dataset(task_config, mode="train"):
             repo_type="dataset",
         )
         logger.info(f"Downloaded dataset to: {dataset_path}")
-    elif hasattr(task_config, "dataset_path"):
-        # Use explicit path if provided
-        dataset_path = os.path.expanduser(task_config.dataset_path)
+
     else:
         raise ValueError(
             "Either dataset_repo/dataset_filename or dataset_path must be provided"
         )
+
+    logger.info(f"Creating dataset from path {dataset_path}")
+    train_subset_percentage = getattr(task_config, "train_subset_percentage", 1.0)
 
     if task_config.env_name in ["can", "lift", "square", "tool_hang", "transport"]:
         if task_config.obs_type == "state":
@@ -64,6 +73,7 @@ def make_dataset(task_config, mode="train"):
                 abs_action=task_config.abs_action,
                 mode=mode,
                 val_dataset_percentage=task_config.val_dataset_percentage,
+                train_subset_percentage=train_subset_percentage
             )
         elif task_config.obs_type == "image":
             return RobomimicImageDataset(
@@ -75,6 +85,7 @@ def make_dataset(task_config, mode="train"):
                 pad_after=task_config.act_steps - 1,
                 abs_action=task_config.abs_action,
                 val_dataset_percentage=task_config.val_dataset_percentage,
+                train_subset_percentage=train_subset_percentage,
                 mode=mode,
             )
         else:
@@ -94,6 +105,7 @@ class RobomimicDataset(BaseDataset):
         abs_action=False,
         rotation_rep="rotation_6d",
         val_dataset_percentage=0.0,
+        train_subset_percentage=1.0,
         mode="train",
         use_key_state_for_val: bool = False,
     ):
@@ -124,6 +136,14 @@ class RobomimicDataset(BaseDataset):
             else:
                 # Use all data for training when no validation split
                 demo_indices = list(range(total_demos))
+
+            if mode == "train" and train_subset_percentage < 1.0:
+                subset_count = int(len(demo_indices) * train_subset_percentage)
+                original_count = len(demo_indices)
+                demo_indices = demo_indices[:subset_count]
+                logger.info(
+                    f"Subsampling training data: using {subset_count}/{original_count} episodes ({train_subset_percentage*100}%)"
+                )
 
             if use_key_state_for_val:
                 import robomimic.utils.env_utils as EnvUtils
@@ -302,6 +322,7 @@ class RobomimicImageDataset(BaseDataset):
         abs_action=False,
         rotation_rep="rotation_6d",
         val_dataset_percentage=0.0,
+        train_subset_percentage=1.0,
         mode="train",
     ):
         super().__init__()
@@ -319,6 +340,7 @@ class RobomimicImageDataset(BaseDataset):
             rotation_transformer=self.rotation_transformer,
             val_dataset_percentage=val_dataset_percentage,
             mode=mode,
+            train_subset_percentage=train_subset_percentage,
         )
 
         rgb_keys = []
@@ -458,6 +480,7 @@ def _convert_robomimic_to_replay(
     n_workers=None,
     max_inflight_tasks=None,
     val_dataset_percentage=0.0,
+    train_subset_percentage=1.0,
     mode="train",
 ):
     """Convert Robomimic dataset to ReplayBuffer.
@@ -586,6 +609,14 @@ def _convert_robomimic_to_replay(
         else:
             # Use all data for training when no validation split
             demo_indices = list(range(total_demos))
+
+        if mode == "train" and train_subset_percentage < 1.0:
+            subset_count = int(len(demo_indices) * train_subset_percentage)
+            original_count = len(demo_indices)
+            demo_indices = demo_indices[:subset_count]
+            logger.info(
+                f"Subsampling training data: using {subset_count}/{original_count} episodes ({train_subset_percentage*100}%)"
+            )
 
         episode_ends = []
         prev_end = 0

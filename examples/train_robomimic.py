@@ -62,17 +62,39 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         resume_state: Optional dict with training state to resume from
     """
     # dataloader
+    batch_size = config.optimization.batch_size
+    num_workers = 4 if config.task.obs_type == "state" else 8
+    drop_last = True
+    dataset_len = len(dataset)
+    # Avoid deadlock when dataset is smaller than batch_size: with drop_last=True
+    # we get 0 batches, so the main process blocks forever waiting for the first
+    # batch from workers that never get any indices.
+    if dataset_len < batch_size:
+        loguru.logger.warning(
+            f"Dataset size ({dataset_len}) < batch_size ({batch_size}); using "
+            "num_workers=0 and drop_last=False to avoid DataLoader deadlock"
+        )
+        num_workers = 0
+        drop_last = False
+    elif dataset_len < batch_size * 2:
+        # Fewer than 2 batches; use num_workers=0 to avoid prefetch deadlocks
+        loguru.logger.warning(
+            f"Dataset size ({dataset_len}) gives very few batches; using "
+            "num_workers=0 for stability"
+        )
+        num_workers = 0
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=config.optimization.batch_size,
-        num_workers=4 if config.task.obs_type == "state" else 8,
+        batch_size=batch_size,
+        num_workers=num_workers,
         shuffle=True,
-        # accelerate cpu-gpu transfer
-        pin_memory=True,
-        # don't kill worker process after each epoch
-        persistent_workers=True,
+        # accelerate cpu-gpu transfer (only when using workers)
+        pin_memory=num_workers > 0,
+        # don't kill worker process after each epoch (only when using workers)
+        persistent_workers=num_workers > 0,
         # IMPORTANT: drop_last=True is required for CUDA graphs (static shapes)
-        drop_last=True,
+        drop_last=drop_last,
     )
     loop_loader = loop_dataloader(dataloader)
 
@@ -478,43 +500,47 @@ def main(config):
     agent = TrainingAgent(config)
     resume_state = None
 
-    if config.optimization.model_path and config.optimization.model_path != "None":
-        loguru.logger.info(f"Loading model from {config.optimization.model_path}")
-        resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
-    elif config.optimization.auto_resume:
-        # Automatically look for checkpoint to resume from
-        checkpoint_base_name = (
-            f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-            f"{config.optimization.loss_type}_{config.network.network_type}_"
-            f"{config.network.emb_dim}_seed{config.optimization.seed}"
-        )
-        checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)
-        if checkpoint_path:
-            loguru.logger.info(f"Found checkpoint to resume from: {checkpoint_path}")
-            loguru.logger.info("Loading checkpoint with optimizer state...")
-            resume_state = agent.load(str(checkpoint_path), load_optimizer=True)
+    try:
+        if config.optimization.model_path and config.optimization.model_path != "None":
+            loguru.logger.info(f"Loading model from {config.optimization.model_path}")
+            resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
+        elif config.optimization.auto_resume:
+            # Automatically look for checkpoint to resume from
+            checkpoint_base_name = (
+                f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
+                f"{config.optimization.loss_type}_{config.network.network_type}_"
+                f"{config.network.emb_dim}_seed{config.optimization.seed}"
+            )
+            checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)
+            if checkpoint_path:
+                loguru.logger.info(f"Found checkpoint to resume from: {checkpoint_path}")
+                loguru.logger.info("Loading checkpoint with optimizer state...")
+                resume_state = agent.load(str(checkpoint_path), load_optimizer=True)
+            else:
+                loguru.logger.info("No checkpoint found, starting training from scratch")
+        elif config.mode == "train" and not config.optimization.auto_resume:
+            loguru.logger.info("Auto-resume disabled, starting training from scratch")
+
+        if config.mode == "train":
+            train(config, envs, dataset, agent, logger, resume_state=resume_state)
+        elif config.mode == "eval":
+            agent.eval()
+
+            num_steps_list = get_default_step_list(config.optimization.loss_type)
+            for num_steps in num_steps_list:
+                metrics = {"step": num_steps}
+                metrics.update(eval(config, envs, dataset, agent, logger, num_steps))
+                logger.log(metrics, category="eval")
+
+            # print result in easy to read format
+            for key, val in metrics.items():
+                if "mean_success" in key:
+                    loguru.logger.info(f"{key} - {val}")
         else:
-            loguru.logger.info("No checkpoint found, starting training from scratch")
-    elif config.mode == "train" and not config.optimization.auto_resume:
-        loguru.logger.info("Auto-resume disabled, starting training from scratch")
-
-    if config.mode == "train":
-        train(config, envs, dataset, agent, logger, resume_state=resume_state)
-    elif config.mode == "eval":
-        agent.eval()
-
-        num_steps_list = get_default_step_list(config.optimization.loss_type)
-        for num_steps in num_steps_list:
-            metrics = {"step": num_steps}
-            metrics.update(eval(config, envs, dataset, agent, logger, num_steps))
-            logger.log(metrics, category="eval")
-
-        # print result in easy to read format
-        for key, val in metrics.items():
-            if "mean_success" in key:
-                loguru.logger.info(f"{key} - {val}")
-    else:
-        raise ValueError("Illegal mode")
+            raise ValueError("Illegal mode")
+    finally:
+        # Always finish the wandb run so multirun jobs get separate runs (no overwriting)
+        logger.finish(agent)
 
 
 if __name__ == "__main__":

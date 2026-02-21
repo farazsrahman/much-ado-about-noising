@@ -277,11 +277,43 @@ uv run examples/collect_robomimic.py \
   ++task.num_demos=200 \
   task.save_video=False
 
-uv run examples/train_robomimic.py \
+uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
   task=square_ph_state \
   network=chiunet \
   optimization.seed=0 \
-  log.eval_freq=1000 \
-  log.log_freq=500 \
+  log.eval_freq=10000 \
+  log.log_freq=5000 \
+  optimization.gradient_steps=50000 \
   log.wandb_mode=online \
-  ++task.dataset_path=$(pwd)/collected_lift.hdf5
+  ++task.dataset_path=$(pwd)/collected_square.hdf5 \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0
+
+uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=square_ph_state \
+  network=chiunet \
+  optimization.seed=0 \
+  log.eval_freq=4 \
+  log.eval_episodes=1 \
+  log.log_freq=1 \
+  log.wandb_mode=online \
+  optimization.gradient_steps=5 \
+  ++task.dataset_path=$(pwd)/collected_square.hdf5 \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0
+
+
+
+
+uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=square_ph_state \
+  network=chiunet \
+  log.group="sweep_robomimic_square_state_ph" \
+  log.eval_freq=5000 \
+  log.log_freq=2500 \
+  optimization.gradient_steps=10000 \
+  log.wandb_mode=online \
+  'task.dataset_path="default","collected_square.hdf5"' \
+  optimization.seed=0,1,2,3,4 \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0

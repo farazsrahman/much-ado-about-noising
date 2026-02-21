@@ -114,6 +114,7 @@ class TaskConfig:
     save_video: bool = False
     shape_meta: dict = field(default_factory=dict)
     render_obs_key: str = "agentview_image"
+    train_subset_percentage: float = 1.0
     val_dataset_percentage: float = 0.0
     # Image observation settings
     rgb_model: str = "resnet18"

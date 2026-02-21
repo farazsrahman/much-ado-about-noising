@@ -7,6 +7,7 @@ Date: 2025-10-03
 
 import contextlib
 import json
+import math
 import os
 import uuid
 from pathlib import Path
@@ -38,11 +39,15 @@ class Logger:
         # Global checkpoints directory (one level up from log_dir)
         self._global_checkpoints_dir = Path(make_dir("checkpoints"))
 
-        # Convert full config dataclass to OmegaConf config, then to container
-        # This uploads all config (optimization, network, task, log) to wandb
+        # Unique run identifier for associating metrics with config
+        self._run_id = str(uuid.uuid4())
+
         omega_config = OmegaConf.structured(config)
 
-        wandb.init(
+        # This uploads all config (optimization, network, task, log) to wandb.
+        # reinit=True ensures a fresh run when using Hydra multirun (same process):
+        # finishes any existing run before creating a new one.
+        run = wandb.init(
             config=OmegaConf.to_container(omega_config),
             project=config.log.project,
             group=config.log.group,
@@ -50,8 +55,28 @@ class Logger:
             id=str(uuid.uuid4()),
             mode=config.log.wandb_mode,
             dir=self._log_dir,
+            reinit=True,
         )
         self._wandb = wandb
+        # Capture URL from the run we just created (not global wandb.run) for multirun safety
+        self._wandb_url = run.url if run else None
+
+        # Append run config to configs.jsonl for association with metrics
+        config_dict = OmegaConf.to_container(omega_config, resolve=True)
+        configs_path = self._log_dir / "configs.jsonl"
+        with configs_path.open("a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "run_id": self._run_id,
+                        "exp_name": config.log.exp_name,
+                        "wandb_url": self._wandb_url,
+                        "config": config_dict,
+                    },
+                    default=str,
+                )
+                + "\n"
+            )
 
     def video_init(self, env, enable=False, video_id=""):
         """Initialize video recording for an environment.
@@ -94,7 +119,7 @@ class Logger:
         loguru.logger.info(metrics_str)
 
         # For JSON logging, create a copy without wandb.Image objects
-        json_safe_dict = {"step": d["step"]}
+        json_safe_dict = {"run_id": self._run_id, "step": d["step"]}
         for k, v in d.items():
             if not isinstance(v, self._wandb.Image):
                 json_safe_dict[k] = v
@@ -131,7 +156,9 @@ class Logger:
         if not agent:
             return
 
-        success_rate_pct = int(success_rate * 100)
+        # Guard against NaN/inf from eval (e.g. single eval episode with no success signal)
+        success_rate_safe = success_rate if math.isfinite(success_rate) else 0.0
+        success_rate_pct = int(success_rate_safe * 100)
         new_checkpoint_name = f"{checkpoint_name}_success{success_rate_pct}"
         new_checkpoint_path = self._global_checkpoints_dir / f"{new_checkpoint_name}.pt"
 

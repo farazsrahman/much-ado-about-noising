@@ -5,7 +5,9 @@ defaults:
 
 # Common dataset configuration
 dataset_repo: "ChaoyiPan/mip-dataset"
+dataset_path: 'default'
 abs_action: true
+train_subset_percentage: 1.0
 
 # Common required keys
 obs_steps: 2
