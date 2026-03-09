@@ -5,10 +5,12 @@ Date: 2025-10-03
 """
 
 import concurrent.futures
+import math
 import os
 from collections import defaultdict
 
 import h5py
+import yaml
 import numpy as np
 import torch
 import zarr
@@ -30,20 +32,88 @@ from mip.datasets.imagecodecs import register_codecs
 register_codecs()
 
 
-def make_dataset(task_config, mode="train"):
+def _load_dataset_config(config_path: str) -> list[dict]:
+    """Load composite dataset config from YAML. Returns list of {path, num_trajectories}."""
+    path = os.path.expanduser(config_path)
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    sources = data.get("sources", [])
+    if not sources:
+        raise ValueError(f"dataset_config_path {config_path} has no 'sources' or empty list")
+    return sources
 
+
+def make_dataset(task_config, mode="train"):
+    train_subset_percentage = getattr(task_config, "train_subset_percentage", 1.0)
+    val_dataset_percentage = getattr(task_config, "val_dataset_percentage", 0.0)
+
+    # Composite dataset: multiple local HDF5s with per-source num_trajectories
+    if getattr(task_config, "dataset_config_path", None):
+        config_path = os.path.expanduser(task_config.dataset_config_path)
+        if not os.path.isabs(config_path):
+            config_path = os.path.abspath(config_path)
+        sources = _load_dataset_config(config_path)
+        logger.info(f"Composite dataset from {config_path}: {len(sources)} sources")
+
+        if task_config.env_name not in ["can", "lift", "square", "tool_hang", "transport"]:
+            raise ValueError(f"Environment {task_config.env_name} not supported")
+        if task_config.obs_type == "state":
+            replay_buffer = _build_composite_state_buffer(
+                sources=sources,
+                mode=mode,
+                val_dataset_percentage=val_dataset_percentage,
+                train_subset_percentage=train_subset_percentage,
+                obs_keys=task_config.obs_keys,
+                abs_action=task_config.abs_action,
+            )
+            return RobomimicDataset(
+                dataset_dir=None,
+                replay_buffer=replay_buffer,
+                horizon=task_config.horizon,
+                obs_keys=task_config.obs_keys,
+                pad_before=task_config.obs_steps - 1,
+                pad_after=task_config.act_steps - 1,
+                abs_action=task_config.abs_action,
+                mode=mode,
+                val_dataset_percentage=val_dataset_percentage,
+                train_subset_percentage=train_subset_percentage,
+            )
+        elif task_config.obs_type == "image":
+            replay_buffer = _build_composite_image_buffer(
+                sources=sources,
+                mode=mode,
+                val_dataset_percentage=val_dataset_percentage,
+                train_subset_percentage=train_subset_percentage,
+                shape_meta=task_config.shape_meta,
+                abs_action=task_config.abs_action,
+            )
+            return RobomimicImageDataset(
+                dataset_dir=None,
+                replay_buffer=replay_buffer,
+                horizon=task_config.horizon,
+                shape_meta=task_config.shape_meta,
+                n_obs_steps=task_config.obs_steps,
+                pad_before=task_config.obs_steps - 1,
+                pad_after=task_config.act_steps - 1,
+                abs_action=task_config.abs_action,
+                val_dataset_percentage=val_dataset_percentage,
+                train_subset_percentage=train_subset_percentage,
+                mode=mode,
+            )
+        else:
+            raise ValueError(f"Invalid observation type: {task_config.obs_type}")
+
+    # Single dataset path
     if hasattr(task_config, "dataset_path") \
         and task_config.dataset_path is not None \
         and task_config.dataset_path != "default":
         # NOTE (faraz): a manually provided path shuold override the hugging face one if provided.
-        # Use explicit path if provided
         dataset_path = os.path.expanduser(task_config.dataset_path)
-
-    # Check if we should download from HuggingFace
     elif hasattr(task_config, "dataset_repo") and hasattr(
         task_config, "dataset_filename"
     ):
-        # Auto-download from HuggingFace
         logger.info(
             f"Downloading dataset from {task_config.dataset_repo}/{task_config.dataset_filename}"
         )
@@ -53,15 +123,12 @@ def make_dataset(task_config, mode="train"):
             repo_type="dataset",
         )
         logger.info(f"Downloaded dataset to: {dataset_path}")
-
     else:
         raise ValueError(
-            "Either dataset_repo/dataset_filename or dataset_path must be provided"
+            "Either dataset_repo/dataset_filename, dataset_path, or dataset_config_path must be provided"
         )
 
     logger.info(f"Creating dataset from path {dataset_path}")
-    train_subset_percentage = getattr(task_config, "train_subset_percentage", 1.0)
-
     if task_config.env_name in ["can", "lift", "square", "tool_hang", "transport"]:
         if task_config.obs_type == "state":
             return RobomimicDataset(
@@ -72,7 +139,7 @@ def make_dataset(task_config, mode="train"):
                 pad_after=task_config.act_steps - 1,
                 abs_action=task_config.abs_action,
                 mode=mode,
-                val_dataset_percentage=task_config.val_dataset_percentage,
+                val_dataset_percentage=val_dataset_percentage,
                 train_subset_percentage=train_subset_percentage
             )
         elif task_config.obs_type == "image":
@@ -84,7 +151,7 @@ def make_dataset(task_config, mode="train"):
                 pad_before=task_config.obs_steps - 1,
                 pad_after=task_config.act_steps - 1,
                 abs_action=task_config.abs_action,
-                val_dataset_percentage=task_config.val_dataset_percentage,
+                val_dataset_percentage=val_dataset_percentage,
                 train_subset_percentage=train_subset_percentage,
                 mode=mode,
             )
@@ -97,7 +164,7 @@ def make_dataset(task_config, mode="train"):
 class RobomimicDataset(BaseDataset):
     def __init__(
         self,
-        dataset_dir,
+        dataset_dir=None,
         horizon=1,
         pad_before=0,
         pad_after=0,
@@ -108,6 +175,7 @@ class RobomimicDataset(BaseDataset):
         train_subset_percentage=1.0,
         mode="train",
         use_key_state_for_val: bool = False,
+        replay_buffer: ReplayBuffer | None = None,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -116,102 +184,105 @@ class RobomimicDataset(BaseDataset):
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
 
-        self.replay_buffer = ReplayBuffer.create_empty_numpy()
-        with h5py.File(dataset_dir) as file:
-            demos = file["data"]
-            total_demos = len(demos)
+        if replay_buffer is not None:
+            self.replay_buffer = replay_buffer
+        else:
+            self.replay_buffer = ReplayBuffer.create_empty_numpy()
+            with h5py.File(dataset_dir) as file:
+                demos = file["data"]
+                total_demos = len(demos)
 
-            # Calculate split indices
-            if val_dataset_percentage > 0.0:
-                val_count = int(total_demos * val_dataset_percentage)
-                train_count = total_demos - val_count
+                # Calculate split indices
+                if val_dataset_percentage > 0.0:
+                    val_count = int(total_demos * val_dataset_percentage)
+                    train_count = total_demos - val_count
 
-                # Use deterministic split based on indices
-                if mode == "train":
-                    demo_indices = list(range(train_count))
-                elif mode == "val":
-                    demo_indices = list(range(train_count, total_demos))
+                    # Use deterministic split based on indices
+                    if mode == "train":
+                        demo_indices = list(range(train_count))
+                    elif mode == "val":
+                        demo_indices = list(range(train_count, total_demos))
+                    else:
+                        raise ValueError(f"Invalid mode: {mode}. Must be 'train' or 'val'")
                 else:
-                    raise ValueError(f"Invalid mode: {mode}. Must be 'train' or 'val'")
-            else:
-                # Use all data for training when no validation split
-                demo_indices = list(range(total_demos))
+                    # Use all data for training when no validation split
+                    demo_indices = list(range(total_demos))
 
-            if mode == "train" and train_subset_percentage < 1.0:
-                subset_count = int(len(demo_indices) * train_subset_percentage)
-                original_count = len(demo_indices)
-                demo_indices = demo_indices[:subset_count]
-                logger.info(
-                    f"Subsampling training data: using {subset_count}/{original_count} episodes ({train_subset_percentage*100}%)"
-                )
-
-            if use_key_state_for_val:
-                import robomimic.utils.env_utils as EnvUtils
-                import robomimic.utils.file_utils as FileUtils
-                import robomimic.utils.obs_utils as ObsUtils
-
-                # Initialize observation utilities with dummy spec
-                dummy_spec = {
-                    "obs": {
-                        "low_dim": ["robot0_eef_pos"],
-                        "rgb": [],
-                    },
-                }
-                ObsUtils.initialize_obs_utils_with_obs_specs(
-                    obs_modality_specs=dummy_spec
-                )
-
-                # Create environment from dataset metadata
-                env_meta = FileUtils.get_env_metadata_from_dataset(
-                    dataset_path=dataset_dir
-                )
-                env = EnvUtils.create_env_from_metadata(
-                    env_meta=env_meta, render=False, render_offscreen=False
-                )
-
-                # Check if this is a robosuite environment
-                is_robosuite_env = EnvUtils.is_robosuite_env(env_meta)
-
-            for i in tqdm(demo_indices, desc=f"Loading {mode} hdf5 to ReplayBuffer"):
-                demo = demos[f"demo_{i}"]
+                if mode == "train" and train_subset_percentage < 1.0:
+                    subset_count = int(len(demo_indices) * train_subset_percentage)
+                    original_count = len(demo_indices)
+                    demo_indices = demo_indices[:subset_count]
+                    logger.info(
+                        f"Subsampling training data: using {subset_count}/{original_count} episodes ({train_subset_percentage*100}%)"
+                    )
 
                 if use_key_state_for_val:
-                    states = demo["states"][:]
-                    # Prepare initial state for environment reset
-                    initial_state = {"states": states[0]}
-                    if is_robosuite_env:
-                        initial_state["model"] = demo.attrs["model_file"]
-                        initial_state["ep_meta"] = demo.attrs.get("ep_meta", None)
+                    import robomimic.utils.env_utils as EnvUtils
+                    import robomimic.utils.file_utils as FileUtils
+                    import robomimic.utils.obs_utils as ObsUtils
 
-                    # Reset environment to initial state
-                    env.reset_to(initial_state)
+                    # Initialize observation utilities with dummy spec
+                    dummy_spec = {
+                        "obs": {
+                            "low_dim": ["robot0_eef_pos"],
+                            "rgb": [],
+                        },
+                    }
+                    ObsUtils.initialize_obs_utils_with_obs_specs(
+                        obs_modality_specs=dummy_spec
+                    )
 
-                    # Evaluate key states in the trajectory
-                    for _j, state in enumerate(states):
-                        env.reset_to({"states": state})
+                    # Create environment from dataset metadata
+                    env_meta = FileUtils.get_env_metadata_from_dataset(
+                        dataset_path=dataset_dir
+                    )
+                    env = EnvUtils.create_env_from_metadata(
+                        env_meta=env_meta, render=False, render_offscreen=False
+                    )
 
-                        # Get distance between frame and stand (example evaluation metric)
-                        frame_site_name = "frame_tip_site"
-                        stand_site_name = "stand_mount_site"
+                    # Check if this is a robosuite environment
+                    is_robosuite_env = EnvUtils.is_robosuite_env(env_meta)
 
-                        frame_site_pos = env.sim.data.site_xpos[
-                            env.obj_site_id[frame_site_name]
-                        ]
-                        stand_site_pos = env.sim.data.site_xpos[
-                            env.obj_site_id[stand_site_name]
-                        ]
-                        distance = np.linalg.norm(frame_site_pos - stand_site_pos)
-                        logger.debug(distance)
-                    exit()
+                for i in tqdm(demo_indices, desc=f"Loading {mode} hdf5 to ReplayBuffer"):
+                    demo = demos[f"demo_{i}"]
 
-                episode = _data_to_obs(
-                    raw_obs=demo["obs"],
-                    raw_actions=demo["actions"][:].astype(np.float32),
-                    obs_keys=obs_keys,
-                    abs_action=abs_action,
-                    rotation_transformer=self.rotation_transformer,
-                )
-                self.replay_buffer.add_episode(episode)
+                    if use_key_state_for_val:
+                        states = demo["states"][:]
+                        # Prepare initial state for environment reset
+                        initial_state = {"states": states[0]}
+                        if is_robosuite_env:
+                            initial_state["model"] = demo.attrs["model_file"]
+                            initial_state["ep_meta"] = demo.attrs.get("ep_meta", None)
+
+                        # Reset environment to initial state
+                        env.reset_to(initial_state)
+
+                        # Evaluate key states in the trajectory
+                        for _j, state in enumerate(states):
+                            env.reset_to({"states": state})
+
+                            # Get distance between frame and stand (example evaluation metric)
+                            frame_site_name = "frame_tip_site"
+                            stand_site_name = "stand_mount_site"
+
+                            frame_site_pos = env.sim.data.site_xpos[
+                                env.obj_site_id[frame_site_name]
+                            ]
+                            stand_site_pos = env.sim.data.site_xpos[
+                                env.obj_site_id[stand_site_name]
+                            ]
+                            distance = np.linalg.norm(frame_site_pos - stand_site_pos)
+                            logger.debug(distance)
+                        exit()
+
+                    episode = _data_to_obs(
+                        raw_obs=demo["obs"],
+                        raw_actions=demo["actions"][:].astype(np.float32),
+                        obs_keys=obs_keys,
+                        abs_action=abs_action,
+                        rotation_transformer=self.rotation_transformer,
+                    )
+                    self.replay_buffer.add_episode(episode)
 
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
@@ -287,6 +358,60 @@ class RobomimicDataset(BaseDataset):
         return torch_data
 
 
+def _build_composite_state_buffer(
+    sources: list[dict],
+    mode: str,
+    val_dataset_percentage: float,
+    train_subset_percentage: float,
+    obs_keys: tuple | list,
+    abs_action: bool,
+) -> ReplayBuffer:
+    """Build a single ReplayBuffer from multiple HDF5 sources.
+    Per source: val split first, then cap by num_trajectories, then apply train_subset_percentage (round up, at least 1).
+    """
+    rotation_transformer = RotationTransformer(from_rep="axis_angle", to_rep="rotation_6d")
+    buffer = ReplayBuffer.create_empty_numpy()
+    for src in sources:
+        path = os.path.expanduser(src["path"])
+        num_trajectories = src.get("num_trajectories")
+        with h5py.File(path) as file:
+            demos = file["data"]
+            total_demos = len(demos)
+            if total_demos == 0:
+                continue
+            if val_dataset_percentage > 0.0:
+                val_count = int(total_demos * val_dataset_percentage)
+                train_count = total_demos - val_count
+                if mode == "train":
+                    demo_indices = list(range(train_count))
+                else:
+                    demo_indices = list(range(train_count, total_demos))
+            else:
+                demo_indices = list(range(total_demos))
+                if mode == "val":
+                    demo_indices = []
+            if mode == "train" and demo_indices:
+                n_available = len(demo_indices)
+                if num_trajectories is not None:
+                    n_available = min(n_available, num_trajectories)
+                n_add = min(n_available, max(1, math.ceil(n_available * train_subset_percentage)))
+                demo_indices = demo_indices[:n_add]
+                logger.info(f"  {path}: adding {n_add} train trajectories (cap {num_trajectories})")
+            elif mode == "val" and demo_indices:
+                logger.info(f"  {path}: adding {len(demo_indices)} val trajectories")
+            for i in tqdm(demo_indices, desc=f"Loading {os.path.basename(path)}", leave=False):
+                demo = demos[f"demo_{i}"]
+                episode = _data_to_obs(
+                    raw_obs=demo["obs"],
+                    raw_actions=demo["actions"][:].astype(np.float32),
+                    obs_keys=obs_keys,
+                    abs_action=abs_action,
+                    rotation_transformer=rotation_transformer,
+                )
+                buffer.add_episode(episode)
+    return buffer
+
+
 def _data_to_obs(raw_obs, raw_actions, obs_keys, abs_action, rotation_transformer):
     obs = np.concatenate([raw_obs[key] for key in obs_keys], axis=-1).astype(np.float32)
 
@@ -313,8 +438,8 @@ def _data_to_obs(raw_obs, raw_actions, obs_keys, abs_action, rotation_transforme
 class RobomimicImageDataset(BaseDataset):
     def __init__(
         self,
-        dataset_dir,
-        shape_meta: dict,
+        dataset_dir=None,
+        shape_meta: dict = None,
         n_obs_steps=None,
         horizon=1,
         pad_before=0,
@@ -324,6 +449,7 @@ class RobomimicImageDataset(BaseDataset):
         val_dataset_percentage=0.0,
         train_subset_percentage=1.0,
         mode="train",
+        replay_buffer: ReplayBuffer | None = None,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -332,16 +458,19 @@ class RobomimicImageDataset(BaseDataset):
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
 
-        self.replay_buffer = _convert_robomimic_to_replay(
-            store=zarr.storage.MemoryStore(),
-            shape_meta=shape_meta,
-            dataset_path=dataset_dir,
-            abs_action=abs_action,
-            rotation_transformer=self.rotation_transformer,
-            val_dataset_percentage=val_dataset_percentage,
-            mode=mode,
-            train_subset_percentage=train_subset_percentage,
-        )
+        if replay_buffer is not None:
+            self.replay_buffer = replay_buffer
+        else:
+            self.replay_buffer = _convert_robomimic_to_replay(
+                store=zarr.storage.MemoryStore(),
+                shape_meta=shape_meta,
+                dataset_path=dataset_dir,
+                abs_action=abs_action,
+                rotation_transformer=self.rotation_transformer,
+                val_dataset_percentage=val_dataset_percentage,
+                mode=mode,
+                train_subset_percentage=train_subset_percentage,
+            )
 
         rgb_keys = []
         lowdim_keys = []
@@ -471,6 +600,67 @@ def _convert_actions(raw_actions, abs_action, rotation_transformer):
     return actions
 
 
+def _build_composite_image_buffer(
+    sources: list[dict],
+    mode: str,
+    val_dataset_percentage: float,
+    train_subset_percentage: float,
+    shape_meta: dict,
+    abs_action: bool,
+) -> ReplayBuffer:
+    """Build a single ReplayBuffer from multiple HDF5 sources (image obs).
+    Per source: val split first, cap by num_trajectories, then train_subset_percentage (round up, at least 1).
+    """
+    rotation_transformer = RotationTransformer(from_rep="axis_angle", to_rep="rotation_6d")
+    merged = ReplayBuffer.create_empty_zarr()
+    for src in sources:
+        path = os.path.expanduser(src["path"])
+        num_trajectories = src.get("num_trajectories")
+        with h5py.File(path) as file:
+            demos = file["data"]
+            total_demos = len(demos)
+        if total_demos == 0:
+            continue
+        if val_dataset_percentage > 0.0:
+            val_count = int(total_demos * val_dataset_percentage)
+            train_count = total_demos - val_count
+            if mode == "train":
+                n_available = train_count
+            else:
+                n_available = val_count
+        else:
+            n_available = total_demos if mode == "train" else 0
+        if mode == "val" and val_dataset_percentage <= 0.0:
+            n_available = 0
+        if num_trajectories is not None and mode == "train":
+            n_available = min(n_available, num_trajectories)
+        if mode == "train" and n_available > 0:
+            n_add = min(n_available, max(1, math.ceil(n_available * train_subset_percentage)))
+        elif mode == "val":
+            n_add = n_available
+        else:
+            n_add = 0
+        if n_add == 0:
+            continue
+        logger.info(f"  {path}: adding {n_add} {'train' if mode == 'train' else 'val'} trajectories (cap {num_trajectories})")
+        store = zarr.storage.MemoryStore()
+        temp_buf = _convert_robomimic_to_replay(
+            store=store,
+            shape_meta=shape_meta,
+            dataset_path=path,
+            abs_action=abs_action,
+            rotation_transformer=rotation_transformer,
+            val_dataset_percentage=val_dataset_percentage,
+            train_subset_percentage=1.0,
+            mode=mode,
+            max_demos=n_add,
+        )
+        for i in range(temp_buf.n_episodes):
+            episode_data = temp_buf.get_episode(i, copy=True)
+            merged.add_episode(episode_data)
+    return merged
+
+
 def _convert_robomimic_to_replay(
     store,
     shape_meta,
@@ -482,6 +672,7 @@ def _convert_robomimic_to_replay(
     val_dataset_percentage=0.0,
     train_subset_percentage=1.0,
     mode="train",
+    max_demos: int | None = None,
 ):
     """Convert Robomimic dataset to ReplayBuffer.
 
@@ -610,12 +801,15 @@ def _convert_robomimic_to_replay(
             # Use all data for training when no validation split
             demo_indices = list(range(total_demos))
 
+        if max_demos is not None:
+            demo_indices = demo_indices[:max_demos]
+
         if mode == "train" and train_subset_percentage < 1.0:
-            subset_count = int(len(demo_indices) * train_subset_percentage)
-            original_count = len(demo_indices)
-            demo_indices = demo_indices[:subset_count]
+            n_available = len(demo_indices)
+            n_add = min(n_available, max(1, math.ceil(n_available * train_subset_percentage)))
+            demo_indices = demo_indices[:n_add]
             logger.info(
-                f"Subsampling training data: using {subset_count}/{original_count} episodes ({train_subset_percentage*100}%)"
+                f"Subsampling training data: using {n_add}/{n_available} episodes ({train_subset_percentage*100}%, round up)"
             )
 
         episode_ends = []

@@ -317,3 +317,253 @@ uv run examples/train_robomimic.py --multirun \
   'task.dataset_path="default","collected_square.hdf5"' \
   optimization.seed=0,1,2,3,4 \
   task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0
+
+
+
+
+# COLLECTION: Collect 200 episodes for the 'square' task with sigma=0.05
+uv run examples/collect_robomimic.py \
+  task=square_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/square_ph_state_flow_chiunet_256_seed2_success97.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.05 \
+  ++task.collected_hdf5_name=collected_square_sigma0.05.hdf5
+
+
+
+
+uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=square_ph_state \
+  network=chiunet \
+  log.group="scaling_mixed_dataset" \
+  log.eval_freq=5000 \
+  log.log_freq=2500 \
+  optimization.gradient_steps=20000 \
+  optimization.seed=0,1,2,3,4 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0 \
+  ++task.dataset_config_path=examples/configs/datasets/robomimic_mix.yaml
+
+
+
+## Train original dataset scaling curves for tool_hand and transport
+
+uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  log.group="tool_hang_og_data" \
+  log.eval_freq=5000 \
+  log.log_freq=2500 \
+  optimization.gradient_steps=50000 \
+  log.wandb_mode=online \
+  'task.dataset_path="default","collected_square.hdf5"' \
+  optimization.seed=0,1,2,3,4 \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0
+
+# initial run to estimate how long it takes to train on all data.
+uv run examples/train_robomimic.py \
+  launcher=basic \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  log.group="tool_hang_og_data" \
+  log.eval_freq=10000 \
+  log.log_freq=2500 \
+  optimization.gradient_steps=50000 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0
+  optimization.seed=0,1,2,3,4 \
+  'task.dataset_path="default"'
+
+
+# collection using the fixed - spherical noise
+
+SIGMA=0.3
+
+
+uv run examples/collect_robomimic.py \
+  task=square_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/square_ph_state/square_ph_state_flow_chiunet_256_seed0_success100.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.3 \
+  ++task.collected_hdf5_name=collected_square_sphere_sigma0.3.hdf5
+
+
+
+uv run examples/collect_robomimic.py \
+  task=square_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/square_ph_state/square_ph_state_flow_chiunet_256_seed0_success100.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.1 \
+  ++task.collected_hdf5_name=collected_square_sphere_sigma0.1.hdf5
+
+
+
+uv run examples/collect_robomimic.py \
+  task=square_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/square_ph_state/square_ph_state_flow_chiunet_256_seed0_success100.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.05 \
+  ++task.collected_hdf5_name=collected_square_sphere_sigma0.05.hdf5
+
+uv run examples/collect_robomimic.py \
+  task=square_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/square_ph_state/square_ph_state_flow_chiunet_256_seed0_success100.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.0 \
+  ++task.collected_hdf5_name=collected_square_sphere_sigma0.0.hdf5
+
+uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=square_ph_state \
+  network=chiunet \
+  log.group="scale_square_ph_spherical_noise_new_ckpt" \
+  log.eval_freq=10000 \
+  log.log_freq=2500 \
+  optimization.gradient_steps=20000 \
+  optimization.seed=0,1,2 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0 \
+  '++task.dataset_config_path="examples/configs/datasets/square_ph_sigma0.0_alpha0.0.yaml","examples/configs/datasets/square_ph_sigma0.1_alpha0.25.yaml"'
+
+
+CUDA_VISIBLE_DEVICES=3 uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=square_ph_state \
+  network=chiunet \
+  log.group="scale_square_ph_spherical_noise_new_ckpt" \
+  log.eval_freq=10000 \
+  log.log_freq=2500 \
+  optimization.gradient_steps=20000 \
+  optimization.seed=0,1,2 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0 \
+  '++task.dataset_config_path="examples/configs/datasets/square_ph_sigma0.05_alpha0.25.yaml","examples/configs/datasets/square_ph_sigma0.3_alpha0.25.yaml"'
+
+
+
+
+
+# COLLECTION: for tool_hang
+uv run examples/collect_robomimic.py \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/tool_hang_ph_state/tool_hang_ph_state_flow_chiunet_256_seed0_success90.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.1 \
+  ++task.collected_hdf5_name=collected_tool_hang_sigma0.1.hdf5
+
+
+uv run examples/collect_robomimic.py \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/tool_hang_ph_state/tool_hang_ph_state_flow_chiunet_256_seed0_success90.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.05 \
+  ++task.collected_hdf5_name=collected_tool_hang_sigma0.05.hdf5
+
+
+uv run examples/collect_robomimic.py \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  optimization.model_path=checkpoints/tool_hang_ph_state/tool_hang_ph_state_flow_chiunet_256_seed0_success90.pt \
+  optimization.seed=0 \
+  task.num_envs=1 \
+  ++task.num_demos=200 \
+  ++task.rejection_sample=True \
+  task.save_video=False \
+  ++task.exploratory_sigma=0.0 \
+  ++task.collected_hdf5_name=collected_tool_hang_sigma0.0.hdf5
+
+
+CUDA_VISIBLE_DEVICES=0 uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  log.group="scale_tool_hang_ph" \
+  log.eval_freq=25000 \
+  log.log_freq=10000 \
+  optimization.gradient_steps=100000 \
+  optimization.seed=0 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0 \
+  '++task.dataset_config_path="examples/configs/datasets/tool_hang_ph_sigma0.1_alpha0.25.yaml"'
+
+
+CUDA_VISIBLE_DEVICES=1 uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  log.group="scale_tool_hang_ph" \
+  log.eval_freq=25000 \
+  log.log_freq=10000 \
+  optimization.gradient_steps=100000 \
+  optimization.seed=0 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0 \
+  '++task.dataset_config_path="examples/configs/datasets/tool_hang_ph_sigma0.0_alpha0.0.yaml"'
+
+
+
+
+
+
+CUDA_VISIBLE_DEVICES=0 uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  log.group="scale_tool_hang_ph" \
+  log.eval_freq=25000 \
+  log.log_freq=10000 \
+  optimization.gradient_steps=100000 \
+  optimization.seed=1,2 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0 \
+  '++task.dataset_config_path="examples/configs/datasets/tool_hang_ph_sigma0.05_alpha0.25.yaml"'
+
+CUDA_VISIBLE_DEVICES=1 uv run examples/train_robomimic.py --multirun \
+  launcher=basic \
+  task=tool_hang_ph_state \
+  network=chiunet \
+  log.group="scale_tool_hang_ph" \
+  log.eval_freq=25000 \
+  log.log_freq=10000 \
+  optimization.gradient_steps=100000 \
+  optimization.seed=1,2 \
+  log.wandb_mode=online \
+  task.train_subset_percentage=0.01,0.05,0.1,0.2,0.3,0.5,0.75,1.0 \
+  '++task.dataset_config_path="examples/configs/datasets/tool_hang_ph_sigma0.0_alpha0.25.yaml"'

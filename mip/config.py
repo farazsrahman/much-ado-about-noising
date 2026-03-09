@@ -96,6 +96,9 @@ class TaskConfig:
     dataset_path: str | None = (
         None  # Local path (deprecated, use dataset_repo/dataset_filename)
     )
+    # Path to a YAML file defining composite dataset sources (path + num_trajectories per source).
+    # When set, overrides dataset_path / dataset_repo+dataset_filename. Local paths only.
+    dataset_config_path: str | None = None
     max_episode_steps: int = 400
     obs_keys: list[str] = field(
         default_factory=lambda: [
