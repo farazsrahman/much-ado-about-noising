@@ -1,0 +1,8 @@
+# Composite dataset: list of local HDF5 paths and how many trajectories to use from each.
+# Use with task.dataset_config_path (e.g. task=can_ph_state dataset_config_path=examples/configs/datasets/robomimic_mix.yaml).
+# Paths are expanded with os.path.expanduser; use absolute or relative to CWD.
+sources:
+  - path: "collected_tool_hang_sigma0.0.hdf5"
+    num_trajectories: 150
+  - path: "collected_tool_hang_sigma0.05.hdf5"
+    num_trajectories: 50
