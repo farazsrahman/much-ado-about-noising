@@ -90,7 +90,7 @@ class Logger:
 
         if enable:
             video_env.video_recoder.stop()
-            video_filename = self._video_dir / f"{video_id}_{uuid.uuid4()}.mp4"
+            video_filename = self._video_dir / f"{video_id}.mp4"
             video_env.file_path = str(video_filename)
         else:
             video_env.file_path = None

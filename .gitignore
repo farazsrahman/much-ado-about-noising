@@ -211,6 +211,7 @@ __marimo__/
 
 outputs/
 wandb/
+explanations/
 tmp/
 data/
 logs/
@@ -218,3 +219,5 @@ checkpoints/
 results/
 node_modules/
 cache/
+videos/
+rollouts/

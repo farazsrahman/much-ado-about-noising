@@ -303,7 +303,7 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
 
         # initialize video stream
         if config.log.save_video:
-            logger.video_init(envs.envs[0], enable=True, video_id=str(i))  # save videos
+            logger.video_init(envs.envs[0], enable=True, video_id=f"{config.task.env_name}_video_{i}")
 
         while t < config.task.max_episode_steps:
             with timed("normalize", inference_times):
@@ -434,6 +434,90 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
     return metrics
 
 
+def save_rollouts(config: Config, envs, dataset, agent, logger, num_steps=1):
+    """Run rollouts and save obs/action pairs to .npz files.
+
+    Saves for each inference step:
+        - obs_unnorm: raw observation from env
+        - obs_norm: normalized observation fed to model
+        - act_norm: normalized action predicted by model
+        - act_unnorm: unnormalized action sent to env
+
+    Files saved to logs/rollouts/{task}_video_{idx}.npz
+    """
+    save_dir = "logs/rollouts"
+    os.makedirs(save_dir, exist_ok=True)
+
+    num_episodes = config.log.eval_episodes // config.task.num_envs
+
+    for i in range(num_episodes):
+        obs, _ = envs.reset()
+        t = 0
+
+        if config.log.save_video:
+            logger.video_init(envs.envs[0], enable=True, video_id=f"{config.task.env_name}_video_{i}")
+
+        obs_unnorm_list = []
+        obs_norm_list = []
+        act_norm_list = []
+        act_unnorm_list = []
+
+        while t < config.task.max_episode_steps:
+            if config.task.obs_type == "state":
+                obs_raw = obs.astype(np.float32)
+                obs_unnorm_list.append(obs_raw.copy())
+
+                obs_n = dataset.normalizer["obs"]["state"].normalize(obs_raw)
+                obs_norm_list.append(obs_n.copy())
+
+                obs_tensor = torch.tensor(obs_n, device=config.optimization.device, dtype=torch.float32)
+                obs_in = {"state": obs_tensor}
+            else:
+                obs_raw = {k: obs[k].astype(np.float32) for k in obs}
+                obs_unnorm_list.append({k: v.copy() for k, v in obs_raw.items()})
+
+                obs_n = {}
+                for k in obs_raw:
+                    obs_n[k] = dataset.normalizer["obs"][k].normalize(obs_raw[k])
+                obs_norm_list.append({k: v.copy() for k, v in obs_n.items()})
+
+                obs_in = {}
+                for k in obs_n:
+                    obs_in[k] = torch.tensor(obs_n[k], device=config.optimization.device, dtype=torch.float32)
+
+            act_0 = torch.randn(
+                (config.task.num_envs, config.task.horizon, config.task.act_dim),
+                device=config.optimization.device,
+            )
+            act_normed = agent.sample(act_0=act_0, obs=obs_in, num_steps=num_steps, use_ema=True)
+            act_normed = act_normed.detach().to("cpu").numpy()
+            act = dataset.normalizer["action"].unnormalize(act_normed)
+
+            start = config.task.obs_steps - 1
+            end = start + config.task.act_steps
+            act_sliced = act[:, start:end, :]
+
+            if config.task.abs_action and config.task.env_name in ["can", "lift", "square", "tool_hang", "transport"]:
+                act_sliced = dataset.undo_transform_action(act_sliced)
+
+            act_norm_list.append(act_normed)
+            act_unnorm_list.append(act_sliced)
+
+            obs, _, _, _, _ = envs.step(act_sliced)
+            t += config.task.act_steps
+
+        save_path = os.path.join(save_dir, f"{config.task.env_name}_video_{i}.npz")
+        if config.task.obs_type == "image":
+            save_kwargs = {f"obs_unnorm_{k}": np.stack([s[k] for s in obs_unnorm_list]) for k in obs_unnorm_list[0]}
+            save_kwargs.update({f"obs_norm_{k}": np.stack([s[k] for s in obs_norm_list]) for k in obs_norm_list[0]})
+        else:
+            save_kwargs = {"obs_unnorm": np.array(obs_unnorm_list), "obs_norm": np.array(obs_norm_list)}
+        save_kwargs["act_norm"] = np.array(act_norm_list)
+        save_kwargs["act_unnorm"] = np.array(act_unnorm_list)
+        np.savez(save_path, **save_kwargs)
+        loguru.logger.info(f"Saved rollout {i} to {save_path}")
+
+
 @hydra.main(version_base=None, config_path="configs/", config_name="main")
 def main(config):
     """Main pipeline function that calls the appropriate standalone function based on mode."""
@@ -478,7 +562,7 @@ def main(config):
     # - action rotation transform helpers (undo_transform_action)
     #
     # This avoids the expensive "Loading ... image data" conversion step.
-    skip_image_loading = (config.mode == "eval") and (config.task.obs_type == "image")
+    skip_image_loading = not (config.mode == "train") and (config.task.obs_type == "image")
     dataset = make_dataset(config.task, skip_image_loading=skip_image_loading)
     loguru.logger.info("Finished setting up dataset")
 
@@ -520,6 +604,10 @@ def main(config):
         for key, val in metrics.items():
             if "mean_success" in key:
                 loguru.logger.info(f"{key} - {val}")
+    elif config.mode == "save_rollouts":
+        agent.eval()
+        num_steps_list = get_default_step_list(config.optimization.loss_type)
+        save_rollouts(config, envs, dataset, agent, logger, num_steps=num_steps_list[0])
     elif config.mode == "train":
         loguru.logger.warning(
             "Eval-only script: training code is commented out. Use mode=eval to evaluate."
