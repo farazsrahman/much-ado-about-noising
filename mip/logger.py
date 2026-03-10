@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 import loguru
+import numpy as np
 import torch
 import wandb
 from omegaconf import OmegaConf
@@ -52,6 +53,25 @@ class Logger:
             dir=self._log_dir,
         )
         self._wandb = wandb
+
+    @staticmethod
+    def _to_jsonable(x):
+        """Convert common ML/NumPy/PyTorch types into JSON-serializable values."""
+        if isinstance(x, torch.Tensor):
+            if x.ndim == 0:
+                return x.item()
+            return x.detach().cpu().tolist()
+        if isinstance(x, np.generic):
+            return x.item()
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+        if isinstance(x, Path):
+            return str(x)
+        if isinstance(x, dict):
+            return {str(k): Logger._to_jsonable(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [Logger._to_jsonable(v) for v in x]
+        return x
 
     def video_init(self, env, enable=False, video_id=""):
         """Initialize video recording for an environment.
@@ -94,10 +114,10 @@ class Logger:
         loguru.logger.info(metrics_str)
 
         # For JSON logging, create a copy without wandb.Image objects
-        json_safe_dict = {"step": d["step"]}
+        json_safe_dict = {"step": self._to_jsonable(d["step"])}
         for k, v in d.items():
             if not isinstance(v, self._wandb.Image):
-                json_safe_dict[k] = v
+                json_safe_dict[str(k)] = self._to_jsonable(v)
 
         # Write to metrics file
         with (self._log_dir / "metrics.jsonl").open("a") as f:

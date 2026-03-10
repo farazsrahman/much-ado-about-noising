@@ -30,7 +30,7 @@ from mip.datasets.imagecodecs import register_codecs
 register_codecs()
 
 
-def make_dataset(task_config, mode="train"):
+def make_dataset(task_config, mode="train", skip_image_loading: bool = False):
     # Check if we should download from HuggingFace
     if hasattr(task_config, "dataset_repo") and hasattr(
         task_config, "dataset_filename"
@@ -76,6 +76,7 @@ def make_dataset(task_config, mode="train"):
                 abs_action=task_config.abs_action,
                 val_dataset_percentage=task_config.val_dataset_percentage,
                 mode=mode,
+                skip_image_loading=skip_image_loading,
             )
         else:
             raise ValueError(f"Invalid observation type: {task_config.obs_type}")
@@ -303,6 +304,7 @@ class RobomimicImageDataset(BaseDataset):
         rotation_rep="rotation_6d",
         val_dataset_percentage=0.0,
         mode="train",
+        skip_image_loading: bool = False,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -310,6 +312,7 @@ class RobomimicImageDataset(BaseDataset):
         )
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
+        self.skip_image_loading = skip_image_loading
 
         self.replay_buffer = _convert_robomimic_to_replay(
             store=zarr.storage.MemoryStore(),
@@ -319,6 +322,7 @@ class RobomimicImageDataset(BaseDataset):
             rotation_transformer=self.rotation_transformer,
             val_dataset_percentage=val_dataset_percentage,
             mode=mode,
+            skip_image_loading=skip_image_loading,
         )
 
         rgb_keys = []
@@ -372,6 +376,12 @@ class RobomimicImageDataset(BaseDataset):
         return len(self.sampler)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if self.skip_image_loading and len(self.rgb_keys) > 0:
+            raise RuntimeError(
+                "RobomimicImageDataset(skip_image_loading=True) does not support "
+                "sampling image observations via __getitem__. This mode is intended "
+                "for eval-time normalizer / transform access without loading RGB frames."
+            )
         sample = self.sampler.sample_sequence(idx)
 
         # obs
@@ -459,6 +469,7 @@ def _convert_robomimic_to_replay(
     max_inflight_tasks=None,
     val_dataset_percentage=0.0,
     mode="train",
+    skip_image_loading: bool = False,
 ):
     """Convert Robomimic dataset to ReplayBuffer.
 
@@ -644,54 +655,55 @@ def _convert_robomimic_to_replay(
             except Exception:
                 return False
 
-        with tqdm(
-            total=n_steps * len(rgb_keys),
-            desc=f"Loading {mode} image data",
-            mininterval=1.0,
-        ) as pbar:
-            # one chunk per thread, therefore no synchronization needed
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=n_workers
-            ) as executor:
-                futures = set()
-                for key in rgb_keys:
-                    data_key = "obs/" + key
-                    shape = tuple(shape_meta["obs"][key]["shape"])
-                    c, h, w = shape
-                    # Use None compressor for zarr v3 compatibility in tests
-                    img_arr = data_group.require_dataset(
-                        name=key,
-                        shape=(n_steps, h, w, c),
-                        chunks=(1, h, w, c),
-                        compressor=None,
-                        dtype=np.uint8,
-                    )
-                    for demo_list_idx, episode_idx in enumerate(demo_indices):
-                        demo = demos[f"demo_{episode_idx}"]
-                        hdf5_arr = demo["obs"][key]
-                        for hdf5_idx in range(hdf5_arr.shape[0]):
-                            if len(futures) >= max_inflight_tasks:
-                                # limit number of inflight tasks
-                                completed, futures = concurrent.futures.wait(
-                                    futures,
-                                    return_when=concurrent.futures.FIRST_COMPLETED,
-                                )
-                                for f in completed:
-                                    if not f.result():
-                                        raise RuntimeError("Failed to encode image!")
-                                pbar.update(len(completed))
+        if not skip_image_loading:
+            with tqdm(
+                total=n_steps * len(rgb_keys),
+                desc=f"Loading {mode} image data",
+                mininterval=1.0,
+            ) as pbar:
+                # one chunk per thread, therefore no synchronization needed
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=n_workers
+                ) as executor:
+                    futures = set()
+                    for key in rgb_keys:
+                        data_key = "obs/" + key
+                        shape = tuple(shape_meta["obs"][key]["shape"])
+                        c, h, w = shape
+                        # Use None compressor for zarr v3 compatibility in tests
+                        img_arr = data_group.require_dataset(
+                            name=key,
+                            shape=(n_steps, h, w, c),
+                            chunks=(1, h, w, c),
+                            compressor=None,
+                            dtype=np.uint8,
+                        )
+                        for demo_list_idx, episode_idx in enumerate(demo_indices):
+                            demo = demos[f"demo_{episode_idx}"]
+                            hdf5_arr = demo["obs"][key]
+                            for hdf5_idx in range(hdf5_arr.shape[0]):
+                                if len(futures) >= max_inflight_tasks:
+                                    # limit number of inflight tasks
+                                    completed, futures = concurrent.futures.wait(
+                                        futures,
+                                        return_when=concurrent.futures.FIRST_COMPLETED,
+                                    )
+                                    for f in completed:
+                                        if not f.result():
+                                            raise RuntimeError("Failed to encode image!")
+                                    pbar.update(len(completed))
 
-                            zarr_idx = episode_starts[demo_list_idx] + hdf5_idx
-                            futures.add(
-                                executor.submit(
-                                    img_copy, img_arr, zarr_idx, hdf5_arr, hdf5_idx
+                                zarr_idx = episode_starts[demo_list_idx] + hdf5_idx
+                                futures.add(
+                                    executor.submit(
+                                        img_copy, img_arr, zarr_idx, hdf5_arr, hdf5_idx
+                                    )
                                 )
-                            )
-                completed, futures = concurrent.futures.wait(futures)
-                for f in completed:
-                    if not f.result():
-                        raise RuntimeError("Failed to encode image!")
-                pbar.update(len(completed))
+                    completed, futures = concurrent.futures.wait(futures)
+                    for f in completed:
+                        if not f.result():
+                            raise RuntimeError("Failed to encode image!")
+                    pbar.update(len(completed))
 
     replay_buffer = ReplayBuffer(root)
     return replay_buffer
