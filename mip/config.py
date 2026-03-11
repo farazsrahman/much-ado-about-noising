@@ -78,6 +78,8 @@ class NetworkConfig:
     # RNN specific configs
     rnn_type: str = "LSTM"  # "LSTM" or "GRU"
     max_freq: float = 100.0
+    # Patch encoder configs
+    patch_size: int = 14
 
 
 @dataclass

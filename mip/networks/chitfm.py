@@ -480,6 +480,187 @@ def test_disable_time_embedding():
     print("=" * 50)
 
 
+class _HookableTransformerDecoderLayer(nn.TransformerDecoderLayer):
+    """TransformerDecoderLayer that captures cross-attention weights after each forward pass."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cross_attn_map: torch.Tensor | None = None
+
+    def get_attention_map(self) -> torch.Tensor | None:
+        """Return last captured cross-attention weights: (B, nhead, Tq, Tk)."""
+        return self._cross_attn_map
+
+    def _mha_block(self, x, mem, attn_mask, key_padding_mask, is_causal=False):
+        out, weights = self.multihead_attn(
+            x, mem, mem,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            is_causal=is_causal,
+            need_weights=True,
+            average_attn_weights=False,  # keep per-head weights: (B, nhead, Tq, Tk)
+        )
+        self._cross_attn_map = weights
+        return self.dropout(out)
+
+
+class PatchChiTransformer(BaseNetwork):
+    """ChiTransformer variant that receives pre-embedded patch tokens from PatchEncoder.
+
+    condition: (B, N_patch_tokens + 1, d_model) — patch tokens + robot state token
+    The network appends a time token then runs encoder -> cross-attention decoder.
+
+    Block attention structure (equivalent to Pi0-style):
+      Obs tokens (patches + robot state + time): self-attend via encoder, never see actions.
+      Action tokens: self-attend (causal) + cross-attend to obs memory.
+    """
+
+    def __init__(
+        self,
+        act_dim: int,
+        Ta: int,
+        d_model: int = 256,
+        nhead: int = 4,
+        num_layers: int = 8,
+        n_cond_layers: int = 0,
+        p_drop_emb: float = 0.0,
+        p_drop_attn: float = 0.1,
+        timestep_emb_type: str = "positional",
+        timestep_emb_params: dict | None = None,
+        disable_time_embedding: bool = False,
+    ):
+        # obs_dim and To are unused (PatchEncoder handles obs embedding)
+        super().__init__(act_dim, Ta, d_model, 1, d_model, num_layers)
+
+        self.d_model = d_model
+        self.Ta = Ta
+        self.act_dim = act_dim
+        self.disable_time_embedding = disable_time_embedding
+
+        # Action input embedding + positional embedding
+        self.input_emb = nn.Linear(act_dim, d_model)
+        self.pos_emb = nn.Parameter(torch.zeros(1, Ta, d_model))
+        self.drop = nn.Dropout(p_drop_emb)
+
+        # Learnable positional embeddings for the two appended condition tokens
+        # (robot state slot and time slot) — patch tokens already have pos emb from PatchEncoder
+        self.cond_extra_pos_emb = nn.Parameter(torch.zeros(1, 2, d_model))
+
+        # Condition encoder: MLP (n_cond_layers=0) or Transformer (n_cond_layers>0).
+        # Switch to Transformer to enable patch-to-patch self-attention (Pi0-style obs block).
+        if n_cond_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model,
+                dropout=p_drop_attn, activation="gelu", batch_first=True, norm_first=True,
+            )
+            self.encoder = _SimpleTransformerEncoder(encoder_layer, n_cond_layers)
+        else:
+            self.encoder = nn.Sequential(
+                nn.Linear(d_model, 4 * d_model), nn.Mish(), nn.Linear(4 * d_model, d_model),
+            )
+
+        # Decoder: causal self-attention + cross-attention to obs memory.
+        # Uses _HookableTransformerDecoderLayer to capture cross-attn weights.
+        decoder_layer = _HookableTransformerDecoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model,
+            dropout=p_drop_attn, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.decoder = _SimpleTransformerDecoder(decoder_layer, num_layers)
+
+        # Time embeddings for flow matching timesteps s and t
+        timestep_emb_params = timestep_emb_params or {}
+        if not disable_time_embedding:
+            self.map_s = SUPPORTED_TIMESTEP_EMBEDDING[timestep_emb_type](d_model // 2, **timestep_emb_params)
+            self.map_t = SUPPORTED_TIMESTEP_EMBEDDING[timestep_emb_type](d_model // 2, **timestep_emb_params)
+        else:
+            self.map_s = self.map_t = None
+
+        # Output head
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, act_dim)
+
+        # Scalar head (same structure as ChiTransformer)
+        self.input_processor = nn.Linear(act_dim, d_model // 4)
+        self.final_processor = nn.Linear(d_model, d_model // 4)
+        self.scalar_head = nn.Linear(d_model // 4 + d_model // 4 + d_model, 1)
+
+        self.apply(_init_weights)
+        torch.nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.cond_extra_pos_emb, mean=0.0, std=0.02)
+        nn.init.constant_(self.scalar_head.weight, 0)
+        nn.init.constant_(self.scalar_head.bias, 0)
+
+    def get_cross_attn_maps(self) -> list[torch.Tensor | None]:
+        """Return cross-attention maps from each decoder layer.
+
+        Call after a forward pass. Each map has shape (B, nhead, Ta, N_obs_tokens).
+        N_obs_tokens layout: [obs_steps * num_cameras * n_patches | state | time].
+        Returns a list of length num_layers (one tensor per decoder layer).
+        """
+        return [layer.get_attention_map() for layer in self.decoder.layers]
+
+    def _causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
+        mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1).bool()
+        return mask.float().masked_fill(mask, float("-inf"))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        s: torch.Tensor,
+        t: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ):
+        """
+        x:         (B, Ta, act_dim)
+        s, t:      (B,) flow matching timesteps
+        condition: (B, N_tokens, d_model) from PatchEncoder
+                   layout: [patch_tokens... | robot_state_token]
+        """
+        b, device = x.shape[0], x.device
+
+        processed_input = self.input_processor(x.mean(dim=1))  # (B, d_model//4)
+
+        # Expand scalar timesteps to batch
+        for ts in (s, t):
+            if not torch.is_tensor(ts):
+                ts = torch.tensor([ts], dtype=torch.float32, device=device)
+            elif ts.dim() == 0:
+                ts = ts[None].to(device)
+        s, t = s.expand(b), t.expand(b)
+
+        if not self.disable_time_embedding:
+            time_token = torch.cat([self.map_s(s), self.map_t(t)], dim=-1).unsqueeze(1)  # (B, 1, d_model)
+        else:
+            time_token = torch.zeros(b, 1, self.d_model, device=device)
+
+        if condition is not None:
+            # Add learnable pos emb to the robot state and time slots
+            robot_state = condition[:, -1:] + self.cond_extra_pos_emb[:, 0:1]  # (B, 1, d_model)
+            time_token  = time_token         + self.cond_extra_pos_emb[:, 1:2]  # (B, 1, d_model)
+            cond_seq = torch.cat([condition[:, :-1], robot_state, time_token], dim=1)
+        else:
+            cond_seq = time_token
+
+        memory = self.encoder(self.drop(cond_seq))  # (B, N_cond, d_model)
+
+        # Action tokens
+        decoder_input = self.drop(self.input_emb(x) + self.pos_emb[:, :x.shape[1]])
+        decoder_output = self.decoder(
+            tgt=decoder_input,
+            memory=memory,
+            tgt_mask=self._causal_mask(x.shape[1], device),
+            memory_mask=None,  # full cross-attention: actions attend to all obs tokens
+        )  # (B, Ta, d_model)
+
+        y = self.head(self.ln_f(decoder_output))  # (B, Ta, act_dim)
+
+        processed_final = self.final_processor(decoder_output.mean(dim=1))
+        scalar_emb = memory.mean(dim=1)
+        scalar = self.scalar_head(torch.cat([processed_input, processed_final, scalar_emb], dim=1))
+
+        return y, scalar
+
+
 if __name__ == "__main__":
     test_chitransformer()
     test_disable_time_embedding()

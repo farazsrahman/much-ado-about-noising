@@ -13,13 +13,14 @@ from mip.encoders import (
     IdentityEncoder,
     MLPEncoder,
     MultiImageObsEncoder,
+    PatchEncoder,
     PerStepMLPEncoder,
 )
 
 
 def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     # Import inside function to avoid circular imports
-    from mip.networks.chitfm import ChiTransformer
+    from mip.networks.chitfm import ChiTransformer, PatchChiTransformer
     from mip.networks.chiunet import ChiUNet
     from mip.networks.jannerunet import JannerUNet
     from mip.networks.mlp import MLP, VanillaMLP
@@ -30,6 +31,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "mlp": MLP,
         "vanilla_mlp": VanillaMLP,
         "chitransformer": ChiTransformer,
+        "patchchitransformer": PatchChiTransformer,
         "chiunet": ChiUNet,
         "jannerunet": JannerUNet,
         "rnn": RNN,
@@ -109,6 +111,18 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
                 }
             )
         return network_class(**rnn_params)
+    elif network_config.network_type == "patchchitransformer":
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            d_model=network_config.emb_dim,
+            nhead=network_config.n_heads,
+            num_layers=network_config.num_layers,
+            p_drop_emb=network_config.dropout,
+            p_drop_attn=network_config.attn_dropout,
+            n_cond_layers=network_config.n_cond_layers,
+            timestep_emb_type=network_config.timestep_emb_type,
+        )
     elif network_config.network_type == "sudeepdit":
         return network_class(
             **common_params,
@@ -121,7 +135,9 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
 
 
 def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
-    if task_config.obs_type == "image":
+    if network_config.network_type == "patchchitransformer":
+        encoder_type = "patch"
+    elif task_config.obs_type == "image":
         # Force image encoder for image observations
         encoder_type = "image"
     elif task_config.obs_type in ["state", "keypoint"]:
@@ -147,6 +163,14 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
             emb_dim=network_config.emb_dim,
             hidden_dims=[network_config.emb_dim] * network_config.num_encoder_layers,
             dropout=network_config.encoder_dropout,
+        )
+    elif encoder_type == "patch":
+        return PatchEncoder(
+            shape_meta=task_config.shape_meta,
+            patch_size=network_config.patch_size,
+            emb_dim=network_config.emb_dim,
+            obs_steps=task_config.obs_steps,
+            resize_shape=task_config.resize_shape,
         )
     elif encoder_type == "image":
         kwargs = {

@@ -7,6 +7,7 @@ Date: 2025-10-03
 """
 
 import copy
+import math
 from collections.abc import Callable
 
 import torch
@@ -882,3 +883,106 @@ class MultiImageObsEncoder(BaseEncoder):
     @property
     def dtype(self):
         return next(iter(self.parameters())).dtype
+
+
+def _make_2d_sinusoidal_pos_emb(n_h: int, n_w: int, d_model: int) -> torch.Tensor:
+    """Fixed 2D sinusoidal position embeddings. Returns (n_h*n_w, d_model)."""
+    assert d_model % 4 == 0, "d_model must be divisible by 4 for 2D sinusoidal embeddings"
+    half = d_model // 2
+    quarter = d_model // 4
+    div_term = torch.exp(torch.arange(0, quarter, dtype=torch.float) * -(math.log(10000.0) / quarter))
+
+    row_pos = torch.arange(n_h, dtype=torch.float)
+    row_emb = torch.zeros(n_h, half)
+    row_emb[:, 0::2] = torch.sin(row_pos.unsqueeze(1) * div_term)
+    row_emb[:, 1::2] = torch.cos(row_pos.unsqueeze(1) * div_term)
+
+    col_pos = torch.arange(n_w, dtype=torch.float)
+    col_emb = torch.zeros(n_w, half)
+    col_emb[:, 0::2] = torch.sin(col_pos.unsqueeze(1) * div_term)
+    col_emb[:, 1::2] = torch.cos(col_pos.unsqueeze(1) * div_term)
+
+    row_emb = row_emb.unsqueeze(1).expand(n_h, n_w, half)  # (n_h, n_w, half)
+    col_emb = col_emb.unsqueeze(0).expand(n_h, n_w, half)  # (n_h, n_w, half)
+    return torch.cat([row_emb, col_emb], dim=-1).reshape(n_h * n_w, d_model)
+
+
+class PatchEncoder(BaseEncoder):
+    """Encodes image observations as raw patch tokens for PatchChiTransformer.
+
+    Input:  obs_dict with image keys (B, obs_steps, C, H, W) and low-dim keys (B, obs_steps, dim)
+    Output: (B, num_cameras * obs_steps * n_patches + 1, emb_dim)
+              └─ patch tokens with 2D sinusoidal + camera + obs_step embeddings
+              └─ one robot state token (all low-dim obs concatenated and projected)
+    """
+
+    def __init__(self, shape_meta: dict, patch_size: int, emb_dim: int, obs_steps: int, resize_shape=None):
+        super().__init__()
+        self.patch_size = patch_size
+        self.obs_steps = obs_steps
+
+        obs_meta = shape_meta["obs"]
+        self.image_keys = sorted(k for k, v in obs_meta.items() if v.get("type") == "rgb")
+        self.low_dim_keys = sorted(k for k, v in obs_meta.items() if v.get("type", "low_dim") == "low_dim")
+        self.num_cameras = len(self.image_keys)
+
+        # Image dimensions (after optional resize)
+        C, H, W = tuple(obs_meta[self.image_keys[0]]["shape"])
+        if resize_shape is not None:
+            H, W = resize_shape
+            self.resize = torchvision.transforms.Resize((H, W), antialias=True)
+        else:
+            self.resize = None
+
+        assert H % patch_size == 0 and W % patch_size == 0, (
+            f"Image size {H}x{W} must be divisible by patch_size={patch_size}"
+        )
+        self.n_h = H // patch_size
+        self.n_w = W // patch_size
+        self.n_patches = self.n_h * self.n_w
+        self.patch_dim = C * patch_size * patch_size
+
+        # state_dim: sum of all low-dim shapes across all obs steps
+        state_dim = sum(obs_meta[k]["shape"][0] for k in self.low_dim_keys) * obs_steps
+        self.state_dim = state_dim
+
+        # Patch projection (shared across all cameras)
+        self.patch_proj = nn.Linear(self.patch_dim, emb_dim)
+        # Learnable camera and obs-step embeddings
+        self.camera_emb = nn.Embedding(self.num_cameras, emb_dim)
+        self.obs_step_emb = nn.Embedding(obs_steps, emb_dim)
+        # Fixed 2D sinusoidal pos embeddings
+        self.register_buffer("pos_emb_2d", _make_2d_sinusoidal_pos_emb(self.n_h, self.n_w, emb_dim))
+        # Robot state projection
+        self.state_proj = nn.Linear(state_dim, emb_dim)
+
+    def forward(self, obs_dict, mask=None):
+        patch_tokens = []
+        p = self.patch_size
+
+        for step_idx in range(self.obs_steps):
+            for cam_idx, key in enumerate(self.image_keys):
+                img = obs_dict[key][:, step_idx]  # (B, C, H, W)
+                if self.resize is not None:
+                    img = self.resize(img)
+                B, C, H, W = img.shape
+
+                # Extract patches: (B, n_patches, C*p*p)
+                patches = img.unfold(2, p, p).unfold(3, p, p)          # (B, C, n_h, n_w, p, p)
+                patches = patches.contiguous().view(B, C, self.n_h, self.n_w, p * p)
+                patches = patches.permute(0, 2, 3, 1, 4).contiguous().view(B, self.n_patches, C * p * p)
+
+                tokens = self.patch_proj(patches)                                   # (B, n_patches, emb_dim)
+                tokens = tokens + self.pos_emb_2d                                  # (B, n_patches, emb_dim)
+                tokens = tokens + self.camera_emb.weight[cam_idx]                  # broadcast (emb_dim,)
+                tokens = tokens + self.obs_step_emb.weight[step_idx]               # broadcast (emb_dim,)
+                patch_tokens.append(tokens)
+
+        all_patches = torch.cat(patch_tokens, dim=1)  # (B, obs_steps*num_cameras*n_patches, emb_dim)
+
+        # Robot state token: concatenate all low-dim obs across all steps
+        low_dim_parts = [obs_dict[k][:, step_idx] for step_idx in range(self.obs_steps) for k in self.low_dim_keys]
+        robot_state = torch.cat(low_dim_parts, dim=-1)          # (B, state_dim)
+        state_token = self.state_proj(robot_state).unsqueeze(1)  # (B, 1, emb_dim)
+
+        return torch.cat([all_patches, state_token], dim=1)  # (B, N_tokens, emb_dim)

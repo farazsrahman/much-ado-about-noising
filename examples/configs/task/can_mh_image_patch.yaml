@@ -1,0 +1,9 @@
+# @package task
+defaults:
+  - can_mh_image
+  - _self_
+
+obs_steps: 1       # single obs step; PatchEncoder supports >1 if needed
+crop_shape: null   # no crop — 84x84 divides evenly by patch_size=14
+random_crop: false
+resize_shape: null # native 84x84 resolution
